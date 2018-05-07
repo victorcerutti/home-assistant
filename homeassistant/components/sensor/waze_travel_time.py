@@ -11,8 +11,9 @@ import requests
 import voluptuous as vol
 
 from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import ATTR_ATTRIBUTION, CONF_NAME, CONF_REGION
+from homeassistant.const import ATTR_ATTRIBUTION, CONF_NAME, CONF_REGION, ATTR_LATITUDE, ATTR_LONGITUDE
 import homeassistant.helpers.config_validation as cv
+import homeassistant.helpers.location as location
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import Throttle
 
@@ -42,6 +43,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
 })
 
+TRACKABLE_DOMAINS = ['device_tracker', 'sensor', 'zone']
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
     """Set up the Waze travel time sensor platform."""
@@ -51,7 +53,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
     region = config.get(CONF_REGION)
 
     try:
-        waze_data = WazeRouteData(origin, destination, region)
+        waze_data = WazeRouteData(hass, origin, destination, region)
     except requests.exceptions.HTTPError as error:
         _LOGGER.error("%s", error)
         return
@@ -109,10 +111,20 @@ class WazeTravelTime(Entity):
 class WazeRouteData(object):
     """Get data from Waze."""
 
-    def __init__(self, origin, destination, region):
+    def __init__(self, hass, origin, destination, region):
         """Initialize the data object."""
-        self._destination = destination
-        self._origin = origin
+        # Check if location is a trackable entity
+        if origin.split('.', 1)[0] in TRACKABLE_DOMAINS:
+            self._origin_entity_id = origin
+        else:
+            self._origin = origin
+
+        if destination.split('.', 1)[0] in TRACKABLE_DOMAINS:
+            self._destination_entity_id = destination
+        else:
+            self._destination = destination
+
+        self._hass = hass
         self._region = region
         self.data = {}
 
@@ -122,6 +134,21 @@ class WazeRouteData(object):
         import WazeRouteCalculator
         _LOGGER.debug("Update in progress...")
         try:
+
+            # Convert device_trackers to google friendly location
+            if hasattr(self, '_origin_entity_id'):
+                self._origin = self._get_location_from_entity(
+                    self._origin_entity_id
+                )
+
+            if hasattr(self, '_destination_entity_id'):
+                self._destination = self._get_location_from_entity(
+                    self._destination_entity_id
+                )
+
+            self._destination = self._resolve_zone(self._destination)
+            self._origin = self._resolve_zone(self._origin)
+
             params = WazeRouteCalculator.WazeRouteCalculator(
                 self._origin, self._destination, self._region, None)
             results = params.calc_all_routes_info()
@@ -134,3 +161,45 @@ class WazeRouteData(object):
         except WazeRouteCalculator.WRCError as exp:
             _LOGGER.error("Error on retrieving data: %s", exp)
             return
+    def _get_location_from_entity(self, entity_id):
+        """Get the location from the entity state or attributes."""
+        entity = self._hass.states.get(entity_id)
+
+        if entity is None:
+            _LOGGER.error("Unable to find entity %s", entity_id)
+            self.valid_api_connection = False
+            return None
+
+        # Check if the entity has location attributes
+        if location.has_location(entity):
+            return self._get_location_from_attributes(entity)
+
+        # Check if device is in a zone
+        zone_entity = self._hass.states.get("zone.%s" % entity.state)
+        if location.has_location(zone_entity):
+            _LOGGER.debug(
+                "%s is in %s, getting zone location",
+                entity_id, zone_entity.entity_id
+            )
+            return self._get_location_from_attributes(zone_entity)
+
+        # If zone was not found in state then use the state as the location
+        if entity_id.startswith("sensor."):
+            return entity.state
+
+        # When everything fails just return nothing
+        return None
+
+    @staticmethod
+    def _get_location_from_attributes(entity):
+        """Get the lat/long string from an entities attributes."""
+        attr = entity.attributes
+        return "%s,%s" % (attr.get(ATTR_LATITUDE), attr.get(ATTR_LONGITUDE))
+
+    def _resolve_zone(self, friendly_name):
+        entities = self._hass.states.all()
+        for entity in entities:
+            if entity.domain == 'zone' and entity.name == friendly_name:
+                return self._get_location_from_attributes(entity)
+
+        return friendly_name
